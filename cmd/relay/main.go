@@ -13,6 +13,7 @@ import (
 
 	"github.com/rajputomsingh/relay/internal/config"
 	"github.com/rajputomsingh/relay/internal/database"
+	"github.com/rajputomsingh/relay/internal/delivery"
 	"github.com/rajputomsingh/relay/internal/handlers"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -36,14 +37,12 @@ func run() error {
 		context.Background(),
 		10*time.Second,
 	)
+
 	client, err := database.Connect(startupCtx, cfg.MongoURI)
 	cancelStartup()
 
 	if err != nil {
-		return errors.New(
-			"MongoDB initialization failed; check configuration, " +
-				"Atlas network access, and database credentials",
-		)
+		return fmt.Errorf("MongoDB initialization failed: %w", err)
 	}
 
 	defer func() {
@@ -62,6 +61,7 @@ func run() error {
 		Database(cfg.MongoDatabase).
 		Collection("events")
 
+	// Create the unique idempotency index.
 	indexCtx, cancelIndex := context.WithTimeout(
 		context.Background(),
 		10*time.Second,
@@ -81,7 +81,41 @@ func run() error {
 	cancelIndex()
 
 	if err != nil {
-		return errors.New("failed to initialize event indexes")
+		return errors.New("failed to initialize idempotency index")
+	}
+
+	// Create indexes used by the delivery worker.
+	deliveryIndexCtx, cancelDeliveryIndex := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+
+	_, err = eventsCollection.Indexes().CreateMany(
+		deliveryIndexCtx,
+		[]mongo.IndexModel{
+			{
+				Keys: bson.D{
+					{Key: "delivery_status", Value: 1},
+					{Key: "next_attempt_at", Value: 1},
+					{Key: "received_at", Value: 1},
+				},
+				Options: options.Index().
+					SetName("idx_delivery_due"),
+			},
+			{
+				Keys: bson.D{
+					{Key: "delivery_status", Value: 1},
+					{Key: "lease_until", Value: 1},
+				},
+				Options: options.Index().
+					SetName("idx_delivery_lease"),
+			},
+		},
+	)
+	cancelDeliveryIndex()
+
+	if err != nil {
+		return errors.New("failed to initialize delivery indexes")
 	}
 
 	mux := http.NewServeMux()
@@ -92,6 +126,7 @@ func run() error {
 	eventsHandler := handlers.NewEventsHandler(
 		eventsCollection,
 		cfg.RelayAPIKey,
+		cfg.WebhookURL != "",
 	)
 	eventsHandler.Register(mux)
 
@@ -111,6 +146,31 @@ func run() error {
 	)
 	defer stop()
 
+	workerDone := make(chan struct{})
+
+	if cfg.WebhookURL != "" {
+		worker := delivery.NewWorker(
+			eventsCollection,
+			delivery.Config{
+				WebhookURL:     cfg.WebhookURL,
+				PollInterval:   time.Duration(cfg.WorkerPollSeconds) * time.Second,
+				MaxAttempts:    cfg.MaxDeliveryAttempts,
+				RequestTimeout: 10 * time.Second,
+				LeaseDuration:  30 * time.Second,
+			},
+		)
+
+		go func() {
+			defer close(workerDone)
+			worker.Run(stopCtx)
+		}()
+
+		log.Println("Webhook delivery enabled")
+	} else {
+		close(workerDone)
+		log.Println("Webhook delivery disabled: RELAY_WEBHOOK_URL is empty")
+	}
+
 	serverErrors := make(chan error, 1)
 
 	go func() {
@@ -124,9 +184,13 @@ func run() error {
 
 	select {
 	case err := <-serverErrors:
+		stop()
+		<-workerDone
+
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
+
 		return fmt.Errorf("HTTP server failed: %w", err)
 
 	case <-stopCtx.Done():
@@ -140,8 +204,13 @@ func run() error {
 
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			_ = server.Close()
+			stop()
+			<-workerDone
 			return errors.New("HTTP server shutdown timed out")
 		}
+
+		stop()
+		<-workerDone
 
 		log.Println("HTTP server shut down gracefully")
 		return nil
