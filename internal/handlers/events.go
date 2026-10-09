@@ -46,6 +46,7 @@ func NewEventsHandler(
 
 func (h *EventsHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/events", h.create)
+	mux.HandleFunc("/v1/events/", h.replay)
 }
 
 func (h *EventsHandler) create(w http.ResponseWriter, r *http.Request) {
