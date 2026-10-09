@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -13,6 +14,9 @@ import (
 	"github.com/rajputomsingh/relay/internal/config"
 	"github.com/rajputomsingh/relay/internal/database"
 	"github.com/rajputomsingh/relay/internal/handlers"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 func main() {
@@ -32,7 +36,6 @@ func run() error {
 		context.Background(),
 		10*time.Second,
 	)
-
 	client, err := database.Connect(startupCtx, cfg.MongoURI)
 	cancelStartup()
 
@@ -55,10 +58,42 @@ func run() error {
 		}
 	}()
 
+	eventsCollection := client.
+		Database(cfg.MongoDatabase).
+		Collection("events")
+
+	indexCtx, cancelIndex := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+
+	_, err = eventsCollection.Indexes().CreateOne(
+		indexCtx,
+		mongo.IndexModel{
+			Keys: bson.D{
+				{Key: "idempotency_key", Value: 1},
+			},
+			Options: options.Index().
+				SetUnique(true).
+				SetName("uniq_event_idempotency_key"),
+		},
+	)
+	cancelIndex()
+
+	if err != nil {
+		return errors.New("failed to initialize event indexes")
+	}
+
 	mux := http.NewServeMux()
 
 	healthHandler := handlers.NewHealthHandler(client)
 	healthHandler.Register(mux)
+
+	eventsHandler := handlers.NewEventsHandler(
+		eventsCollection,
+		cfg.RelayAPIKey,
+	)
+	eventsHandler.Register(mux)
 
 	server := &http.Server{
 		Addr:              ":" + cfg.Port,
@@ -92,7 +127,7 @@ func run() error {
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
-		return errors.New("HTTP server failed")
+		return fmt.Errorf("HTTP server failed: %w", err)
 
 	case <-stopCtx.Done():
 		log.Println("Shutdown signal received")
