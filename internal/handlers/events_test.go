@@ -164,3 +164,73 @@ func TestCreateEventRejectsOversizedBody(t *testing.T) {
 		)
 	}
 }
+
+func TestReplayEventRejectsInvalidRequests(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		apiKey     string
+		path       string
+		enabled    bool
+		wantStatus int
+	}{
+		{
+			name:       "rejects non-POST method",
+			method:     http.MethodGet,
+			apiKey:     testAPIKey,
+			path:       "/v1/events/507f1f77bcf86cd799439011/replay",
+			enabled:    true,
+			wantStatus: http.StatusMethodNotAllowed,
+		},
+		{
+			name:       "rejects missing API key",
+			method:     http.MethodPost,
+			path:       "/v1/events/507f1f77bcf86cd799439011/replay",
+			enabled:    true,
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "rejects incorrect API key",
+			method:     http.MethodPost,
+			apiKey:     "incorrect-key",
+			path:       "/v1/events/507f1f77bcf86cd799439011/replay",
+			enabled:    true,
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "rejects replay when delivery is disabled",
+			method:     http.MethodPost,
+			apiKey:     testAPIKey,
+			path:       "/v1/events/507f1f77bcf86cd799439011/replay",
+			wantStatus: http.StatusServiceUnavailable,
+		},
+		{
+			name:       "rejects invalid event ID",
+			method:     http.MethodPost,
+			apiKey:     testAPIKey,
+			path:       "/v1/events/not-an-object-id/replay",
+			enabled:    true,
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			NewEventsHandler(nil, testAPIKey, tt.enabled).Register(mux)
+
+			req := httptest.NewRequest(tt.method, tt.path, nil)
+			if tt.apiKey != "" {
+				req.Header.Set("Authorization", "Bearer "+tt.apiKey)
+			}
+
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("expected status %d, got %d; response: %s",
+					tt.wantStatus, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
