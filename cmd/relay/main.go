@@ -57,9 +57,10 @@ func run() error {
 		}
 	}()
 
-	eventsCollection := client.
-		Database(cfg.MongoDatabase).
-		Collection("events")
+	db := client.Database(cfg.MongoDatabase)
+
+	eventsCollection := db.Collection("events")
+	attemptsCollection := db.Collection("delivery_attempts")
 
 	// Create the unique idempotency index.
 	indexCtx, cancelIndex := context.WithTimeout(
@@ -118,6 +119,29 @@ func run() error {
 		return errors.New("failed to initialize delivery indexes")
 	}
 
+	// Create an index for querying attempts by event and time.
+	attemptIndexCtx, cancelAttemptIndex := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+
+	_, err = attemptsCollection.Indexes().CreateOne(
+		attemptIndexCtx,
+		mongo.IndexModel{
+			Keys: bson.D{
+				{Key: "event_id", Value: 1},
+				{Key: "started_at", Value: -1},
+			},
+			Options: options.Index().
+				SetName("idx_attempts_event_started"),
+		},
+	)
+	cancelAttemptIndex()
+
+	if err != nil {
+		return errors.New("failed to initialize delivery attempt indexes")
+	}
+
 	mux := http.NewServeMux()
 
 	healthHandler := handlers.NewHealthHandler(client)
@@ -151,6 +175,7 @@ func run() error {
 	if cfg.WebhookURL != "" {
 		worker := delivery.NewWorker(
 			eventsCollection,
+			attemptsCollection,
 			delivery.Config{
 				WebhookURL:     cfg.WebhookURL,
 				PollInterval:   time.Duration(cfg.WorkerPollSeconds) * time.Second,
@@ -159,7 +184,6 @@ func run() error {
 				LeaseDuration:  30 * time.Second,
 			},
 		)
-
 		go func() {
 			defer close(workerDone)
 			worker.Run(stopCtx)

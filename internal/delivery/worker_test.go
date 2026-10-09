@@ -7,7 +7,7 @@ import (
 )
 
 func TestRetryDelay(t *testing.T) {
-	worker := NewWorker(nil, Config{
+	worker := NewWorker(nil, nil, Config{
 		MaxAttempts:    8,
 		RequestTimeout: 10 * time.Second,
 		LeaseDuration:  30 * time.Second,
@@ -43,7 +43,7 @@ func TestRetryDelay(t *testing.T) {
 }
 
 func TestWorkerDoesNotFollowRedirects(t *testing.T) {
-	worker := NewWorker(nil, Config{
+	worker := NewWorker(nil, nil, Config{
 		WebhookURL:     "https://example.com/webhook",
 		RequestTimeout: 10 * time.Second,
 	})
