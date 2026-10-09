@@ -44,3 +44,4 @@ Never commit `.env` or expose database credentials.
 ## License
 
 A license will be added before the first public release.
+    
