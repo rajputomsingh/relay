@@ -2,7 +2,7 @@ package database
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -11,6 +11,10 @@ import (
 )
 
 func Connect(ctx context.Context, uri string) (*mongo.Client, error) {
+	if uri == "" {
+		return nil, fmt.Errorf("MongoDB URI is empty; check MONGODB_URI in .env")
+	}
+
 	client, err := mongo.Connect(
 		options.Client().
 			ApplyURI(uri).
@@ -18,7 +22,7 @@ func Connect(ctx context.Context, uri string) (*mongo.Client, error) {
 			SetServerSelectionTimeout(5 * time.Second),
 	)
 	if err != nil {
-		return nil, errors.New("failed to initialize MongoDB client")
+		return nil, fmt.Errorf("failed to initialize MongoDB client: %w", err)
 	}
 
 	if err := client.Ping(ctx, readpref.Primary()); err != nil {
@@ -29,7 +33,8 @@ func Connect(ctx context.Context, uri string) (*mongo.Client, error) {
 		defer cancel()
 
 		_ = client.Disconnect(cleanupCtx)
-		return nil, errors.New("MongoDB is unreachable")
+
+		return nil, fmt.Errorf("MongoDB ping failed: %w", err)
 	}
 
 	return client, nil

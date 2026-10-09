@@ -17,8 +17,9 @@ import (
 const maxEventBody = 1 << 20
 
 type EventsHandler struct {
-	collection *mongo.Collection
-	apiKey     string
+	collection      *mongo.Collection
+	apiKey          string
+	deliveryEnabled bool
 }
 
 type createEventRequest struct {
@@ -27,15 +28,25 @@ type createEventRequest struct {
 	Data      map[string]any `json:"data"`
 }
 
-func NewEventsHandler(collection *mongo.Collection, apiKey string) *EventsHandler {
+// The variadic argument preserves compatibility with existing tests
+// and callers that use NewEventsHandler(collection, apiKey).
+func NewEventsHandler(
+	collection *mongo.Collection,
+	apiKey string,
+	deliveryEnabled ...bool,
+) *EventsHandler {
+	enabled := len(deliveryEnabled) > 0 && deliveryEnabled[0]
+
 	return &EventsHandler{
-		collection: collection,
-		apiKey:     apiKey,
+		collection:      collection,
+		apiKey:          apiKey,
+		deliveryEnabled: enabled,
 	}
 }
 
 func (h *EventsHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/events", h.create)
+	mux.HandleFunc("/v1/events/", h.replay)
 }
 
 func (h *EventsHandler) create(w http.ResponseWriter, r *http.Request) {
@@ -48,12 +59,16 @@ func (h *EventsHandler) create(w http.ResponseWriter, r *http.Request) {
 
 	auth := r.Header.Get("Authorization")
 	providedKey := ""
+
 	if strings.HasPrefix(auth, "Bearer ") {
 		providedKey = strings.TrimPrefix(auth, "Bearer ")
 	}
 
 	if providedKey == "" ||
-		subtle.ConstantTimeCompare([]byte(providedKey), []byte(h.apiKey)) != 1 {
+		subtle.ConstantTimeCompare(
+			[]byte(providedKey),
+			[]byte(h.apiKey),
+		) != 1 {
 		writeEventJSON(w, http.StatusUnauthorized, map[string]any{
 			"error": "invalid or missing API key",
 		})
@@ -124,13 +139,22 @@ func (h *EventsHandler) create(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
+	deliveryStatus := "disabled"
+	if h.deliveryEnabled {
+		deliveryStatus = "pending"
+	}
+
+	now := time.Now().UTC()
+
 	doc := bson.M{
-		"source":          req.Source,
-		"event_type":      req.EventType,
-		"data":            req.Data,
-		"idempotency_key": key,
-		"received_at":     time.Now().UTC(),
-		"status":          "accepted",
+		"source":            req.Source,
+		"event_type":        req.EventType,
+		"data":              req.Data,
+		"idempotency_key":   key,
+		"received_at":       now,
+		"status":            "accepted",
+		"delivery_status":   deliveryStatus,
+		"delivery_attempts": 0,
 	}
 
 	result, err := h.collection.InsertOne(ctx, doc)

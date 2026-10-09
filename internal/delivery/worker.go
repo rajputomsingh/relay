@@ -1,0 +1,335 @@
+package delivery
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"math/rand"
+	"net/http"
+	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+)
+
+type Config struct {
+	WebhookURL     string
+	PollInterval   time.Duration
+	MaxAttempts    int
+	RequestTimeout time.Duration
+	LeaseDuration  time.Duration
+}
+
+type Worker struct {
+	events *mongo.Collection
+	config Config
+	client *http.Client
+}
+
+type eventRecord struct {
+	ID             bson.ObjectID  `bson:"_id"`
+	Source         string         `bson:"source"`
+	EventType      string         `bson:"event_type"`
+	Data           map[string]any `bson:"data"`
+	IdempotencyKey string         `bson:"idempotency_key"`
+	ReceivedAt     time.Time      `bson:"received_at"`
+	Attempts       int            `bson:"delivery_attempts"`
+}
+
+type webhookPayload struct {
+	EventID        string         `json:"event_id"`
+	Source         string         `json:"source"`
+	EventType      string         `json:"event_type"`
+	Data           map[string]any `json:"data"`
+	IdempotencyKey string         `json:"idempotency_key"`
+	ReceivedAt     time.Time      `json:"received_at"`
+}
+
+func NewWorker(events *mongo.Collection, cfg Config) *Worker {
+	return &Worker{
+		events: events,
+		config: cfg,
+		client: &http.Client{
+			Timeout: cfg.RequestTimeout,
+			CheckRedirect: func(
+				req *http.Request,
+				via []*http.Request,
+			) error {
+				return http.ErrUseLastResponse
+			},
+		},
+	}
+}
+
+// Run polls MongoDB until the context is cancelled.
+// Start the worker only when a webhook destination is configured.
+func (w *Worker) Run(ctx context.Context) {
+	if w.config.PollInterval <= 0 {
+		log.Println("delivery worker: poll interval must be positive")
+		return
+	}
+
+	ticker := time.NewTicker(w.config.PollInterval)
+	defer ticker.Stop()
+
+	log.Println("Relay delivery worker started")
+
+	for {
+		if ctx.Err() != nil {
+			log.Println("Relay delivery worker stopped")
+			return
+		}
+
+		if err := w.processOne(ctx); err != nil &&
+			!errors.Is(err, mongo.ErrNoDocuments) &&
+			ctx.Err() == nil {
+			log.Printf("delivery worker: %v", err)
+		}
+
+		select {
+		case <-ctx.Done():
+			log.Println("Relay delivery worker stopped")
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// claim atomically assigns one due event to this worker.
+// Expired leases can be reclaimed if attempts remain.
+func (w *Worker) claim(ctx context.Context) (eventRecord, error) {
+	now := time.Now().UTC()
+
+	filter := bson.M{
+		"$or": []bson.M{
+			{
+				"delivery_status": "pending",
+				"$or": []bson.M{
+					{"next_attempt_at": bson.M{"$exists": false}},
+					{"next_attempt_at": bson.M{"$lte": now}},
+				},
+			},
+			{
+				"delivery_status":   "processing",
+				"lease_until":       bson.M{"$lte": now},
+				"delivery_attempts": bson.M{"$lt": w.config.MaxAttempts},
+			},
+		},
+	}
+
+	update := bson.M{
+		"$set": bson.M{
+			"delivery_status": "processing",
+			"lease_until":     now.Add(w.config.LeaseDuration),
+			"last_attempt_at": now,
+		},
+		"$inc": bson.M{
+			"delivery_attempts": 1,
+		},
+	}
+
+	var event eventRecord
+
+	err := w.events.FindOneAndUpdate(
+		ctx,
+		filter,
+		update,
+		options.FindOneAndUpdate().
+			SetSort(bson.D{{Key: "received_at", Value: 1}}).
+			SetReturnDocument(options.After),
+	).Decode(&event)
+
+	return event, err
+}
+
+// failExhaustedLeases permanently fails expired jobs that have
+// already used all configured delivery attempts.
+func (w *Worker) failExhaustedLeases(ctx context.Context) error {
+	now := time.Now().UTC()
+
+	_, err := w.events.UpdateMany(
+		ctx,
+		bson.M{
+			"delivery_status":   "processing",
+			"lease_until":       bson.M{"$lte": now},
+			"delivery_attempts": bson.M{"$gte": w.config.MaxAttempts},
+		},
+		bson.M{
+			"$set": bson.M{
+				"delivery_status":     "failed",
+				"failed_at":           now,
+				"last_delivery_error": "Delivery lease expired after maximum attempts",
+			},
+			"$unset": bson.M{
+				"lease_until":     "",
+				"next_attempt_at": "",
+			},
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("recover exhausted delivery leases: %w", err)
+	}
+
+	return nil
+}
+
+func (w *Worker) processOne(ctx context.Context) error {
+	if err := w.failExhaustedLeases(ctx); err != nil {
+		return err
+	}
+
+	event, err := w.claim(ctx)
+	if err != nil {
+		return err
+	}
+
+	payload := webhookPayload{
+		EventID:        event.ID.Hex(),
+		Source:         event.Source,
+		EventType:      event.EventType,
+		Data:           event.Data,
+		IdempotencyKey: event.IdempotencyKey,
+		ReceivedAt:     event.ReceivedAt,
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return w.recordFailure(ctx, event, err)
+	}
+
+	requestCtx, cancel := context.WithTimeout(
+		ctx,
+		w.config.RequestTimeout,
+	)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(
+		requestCtx,
+		http.MethodPost,
+		w.config.WebhookURL,
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return w.recordFailure(ctx, event, err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Relay-Webhook/1.0")
+	req.Header.Set("Idempotency-Key", event.IdempotencyKey)
+	req.Header.Set("X-Relay-Event-ID", event.ID.Hex())
+
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return w.recordFailure(ctx, event, err)
+	}
+	defer resp.Body.Close()
+
+	// Drain only a limited amount of the response body.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+
+	if resp.StatusCode < http.StatusOK ||
+		resp.StatusCode >= http.StatusMultipleChoices {
+		return w.recordFailure(
+			ctx,
+			event,
+			fmt.Errorf("webhook returned HTTP %d", resp.StatusCode),
+		)
+	}
+
+	_, err = w.events.UpdateOne(
+		ctx,
+		bson.M{
+			"_id":             event.ID,
+			"delivery_status": "processing",
+		},
+		bson.M{
+			"$set": bson.M{
+				"delivery_status": "delivered",
+				"delivered_at":    time.Now().UTC(),
+			},
+			"$unset": bson.M{
+				"lease_until":         "",
+				"next_attempt_at":     "",
+				"last_delivery_error": "",
+			},
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("mark event delivered: %w", err)
+	}
+
+	return nil
+}
+
+func (w *Worker) recordFailure(
+	ctx context.Context,
+	event eventRecord,
+	cause error,
+) error {
+	now := time.Now().UTC()
+
+	set := bson.M{
+		"last_delivery_error": cause.Error(),
+	}
+
+	unset := bson.M{
+		"lease_until": "",
+	}
+
+	if event.Attempts >= w.config.MaxAttempts {
+		set["delivery_status"] = "failed"
+		set["failed_at"] = now
+		unset["next_attempt_at"] = ""
+	} else {
+		set["delivery_status"] = "pending"
+		set["next_attempt_at"] = now.Add(
+			w.retryDelay(event.Attempts),
+		)
+	}
+
+	_, err := w.events.UpdateOne(
+		ctx,
+		bson.M{
+			"_id":             event.ID,
+			"delivery_status": "processing",
+		},
+		bson.M{
+			"$set":   set,
+			"$unset": unset,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"record delivery failure (%v): %w",
+			cause,
+			err,
+		)
+	}
+
+	return nil
+}
+
+// retryDelay uses exponential backoff capped at five minutes,
+// with up to 25% additional jitter.
+func (w *Worker) retryDelay(attempt int) time.Duration {
+	delay := 2 * time.Second
+
+	for i := 1; i < attempt && delay < 5*time.Minute; i++ {
+		delay *= 2
+	}
+
+	if delay > 5*time.Minute {
+		delay = 5 * time.Minute
+	}
+
+	jitter := time.Duration(
+		rand.Int63n(int64(delay/4) + 1),
+	)
+
+	return delay + jitter
+}
