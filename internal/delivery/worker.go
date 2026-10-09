@@ -26,9 +26,10 @@ type Config struct {
 }
 
 type Worker struct {
-	events *mongo.Collection
-	config Config
-	client *http.Client
+	events   *mongo.Collection
+	attempts *mongo.Collection
+	config   Config
+	client   *http.Client
 }
 
 type eventRecord struct {
@@ -50,10 +51,15 @@ type webhookPayload struct {
 	ReceivedAt     time.Time      `json:"received_at"`
 }
 
-func NewWorker(events *mongo.Collection, cfg Config) *Worker {
+func NewWorker(
+	events *mongo.Collection,
+	attempts *mongo.Collection,
+	cfg Config,
+) *Worker {
 	return &Worker{
-		events: events,
-		config: cfg,
+		events:   events,
+		attempts: attempts,
+		config:   cfg,
 		client: &http.Client{
 			Timeout: cfg.RequestTimeout,
 			CheckRedirect: func(
@@ -178,7 +184,7 @@ func (w *Worker) failExhaustedLeases(ctx context.Context) error {
 	return nil
 }
 
-func (w *Worker) processOne(ctx context.Context) error {
+func (w *Worker) processOne(ctx context.Context) (resultErr error) {
 	if err := w.failExhaustedLeases(ctx); err != nil {
 		return err
 	}
@@ -187,6 +193,50 @@ func (w *Worker) processOne(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
+	startedAt := time.Now().UTC()
+	httpStatus := 0
+	outcome := "failed"
+	var attemptErr error
+
+	// Save attempt history independently from the event's delivery state.
+	// A history-write failure must not trigger another webhook delivery.
+	defer func() {
+		finishedAt := time.Now().UTC()
+		attempt := Attempt{
+			EventID:       event.ID,
+			AttemptNumber: event.Attempts,
+			StartedAt:     startedAt,
+			FinishedAt:    finishedAt,
+			DurationMS:    finishedAt.Sub(startedAt).Milliseconds(),
+			HTTPStatus:    httpStatus,
+			Outcome:       outcome,
+		}
+
+		if attemptErr != nil {
+			attempt.Error = attemptErr.Error()
+		}
+
+		if w.attempts == nil {
+			log.Printf(
+				"delivery attempt history unavailable for event %s",
+				event.ID.Hex(),
+			)
+			return
+		}
+
+		saveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if _, saveErr := w.attempts.InsertOne(saveCtx, attempt); saveErr != nil {
+			log.Printf(
+				"delivery attempt history: event %s attempt %d: %v",
+				event.ID.Hex(),
+				event.Attempts,
+				saveErr,
+			)
+		}
+	}()
 
 	payload := webhookPayload{
 		EventID:        event.ID.Hex(),
@@ -199,6 +249,7 @@ func (w *Worker) processOne(ctx context.Context) error {
 
 	body, err := json.Marshal(payload)
 	if err != nil {
+		attemptErr = err
 		return w.recordFailure(ctx, event, err)
 	}
 
@@ -215,6 +266,7 @@ func (w *Worker) processOne(ctx context.Context) error {
 		bytes.NewReader(body),
 	)
 	if err != nil {
+		attemptErr = err
 		return w.recordFailure(ctx, event, err)
 	}
 
@@ -225,21 +277,25 @@ func (w *Worker) processOne(ctx context.Context) error {
 
 	resp, err := w.client.Do(req)
 	if err != nil {
+		attemptErr = err
 		return w.recordFailure(ctx, event, err)
 	}
 	defer resp.Body.Close()
+
+	httpStatus = resp.StatusCode
 
 	// Drain only a limited amount of the response body.
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 
 	if resp.StatusCode < http.StatusOK ||
 		resp.StatusCode >= http.StatusMultipleChoices {
-		return w.recordFailure(
-			ctx,
-			event,
-			fmt.Errorf("webhook returned HTTP %d", resp.StatusCode),
-		)
+		attemptErr = fmt.Errorf("webhook returned HTTP %d", resp.StatusCode)
+		return w.recordFailure(ctx, event, attemptErr)
 	}
+
+	// The receiver acknowledged delivery. Keep this outcome even if
+	// updating the event document subsequently fails.
+	outcome = "delivered"
 
 	_, err = w.events.UpdateOne(
 		ctx,
