@@ -119,7 +119,7 @@ func run() error {
 		return errors.New("failed to initialize delivery indexes")
 	}
 
-	// Create an index for querying attempts by event and time.
+	// Index for querying attempts by event and time.
 	attemptIndexCtx, cancelAttemptIndex := context.WithTimeout(
 		context.Background(),
 		10*time.Second,
@@ -142,6 +142,31 @@ func run() error {
 		return errors.New("failed to initialize delivery attempt indexes")
 	}
 
+	// Compound index for stable cursor-based attempt pagination.
+	paginationIndexCtx, cancelPaginationIndex := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+
+	_, err = attemptsCollection.Indexes().CreateOne(
+		paginationIndexCtx,
+		mongo.IndexModel{
+			Keys: bson.D{
+				{Key: "event_id", Value: 1},
+				{Key: "started_at", Value: -1},
+				{Key: "_id", Value: -1},
+			},
+			Options: options.Index().
+				SetName("idx_attempts_event_started_id"),
+		},
+	)
+	cancelPaginationIndex()
+
+	if err != nil {
+		return errors.New("failed to initialize attempt pagination index")
+	}
+
+	// Register HTTP handlers.
 	mux := http.NewServeMux()
 
 	healthHandler := handlers.NewHealthHandler(client)
@@ -153,6 +178,13 @@ func run() error {
 		cfg.WebhookURL != "",
 	)
 	eventsHandler.Register(mux)
+
+	inspectionHandler := handlers.NewInspectionHandler(
+		eventsCollection,
+		attemptsCollection,
+		cfg.RelayAPIKey,
+	)
+	inspectionHandler.Register(mux)
 
 	server := &http.Server{
 		Addr:              ":" + cfg.Port,
@@ -184,6 +216,7 @@ func run() error {
 				LeaseDuration:  30 * time.Second,
 			},
 		)
+
 		go func() {
 			defer close(workerDone)
 			worker.Run(stopCtx)
